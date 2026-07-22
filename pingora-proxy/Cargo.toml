@@ -83,6 +83,14 @@ name = "connection_filter"
 required-features = ["connection_filter"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
+[[bench]]
+name = "noop_body_filter"
+harness = false
+
+[[bench]]
+name = "proxy_overhead"
+harness = false
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_async_trait"]
 
