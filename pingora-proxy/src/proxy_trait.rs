@@ -109,6 +109,21 @@ where
         Ok(false)
     }
 
+    /// Choose whether to hold the final upstream response header until a
+    /// response-body verdict is ready.
+    ///
+    /// This runs after [`Self::request_filter`] and before cache lookup. A
+    /// held request bypasses the cache.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    fn response_commit_policy(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> ResponseCommitPolicy {
+        ResponseCommitPolicy::Immediate
+    }
+
     /// Handle the incoming request before any downstream module is executed.
     ///
     /// This function is similar to [Self::request_filter()] but executes before any other logic,
@@ -553,6 +568,46 @@ where
         Self::CTX: Send + Sync,
     {
         Ok(None)
+    }
+
+    /// Called instead of [`Self::upstream_response_body_filter`] while the
+    /// final header is held by [`ResponseCommitPolicy::Hold`].
+    ///
+    /// Until it commits, the hook must leave the body chunk as `None`, and must
+    /// commit on end of stream. After commit, the normal body filters run.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    async fn held_upstream_response_body_filter(
+        &self,
+        _response: HeldResponseBody<'_, DS>,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "ResponseCommitPolicy::Hold requires held_upstream_response_body_filter",
+        )
+    }
+
+    /// Called instead of [`Self::upstream_response_trailer_filter`] while the
+    /// final header is held. The hook must commit before returning.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    async fn held_upstream_response_trailer_filter(
+        &self,
+        _response: HeldResponse<'_, DS>,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "held response reached trailers without a committed header",
+        )
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers
