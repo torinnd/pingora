@@ -393,7 +393,15 @@ where
                     return Err(e);
                 }
             }
-            filtered_tasks.push(task);
+            match session.response_gate_task(task)? {
+                ResponseGateTask::Forward(task) => filtered_tasks.push(task),
+                ResponseGateTask::HeaderHeld => {
+                    session
+                        .flush_response_gate_prefix(&mut filtered_tasks)
+                        .await?;
+                }
+                ResponseGateTask::Suppress => {}
+            }
         }
 
         if !serve_from_cache.should_send_to_downstream() {
@@ -401,7 +409,7 @@ where
             return Ok(None);
         }
 
-        let response_done = session.write_response_tasks(filtered_tasks).await?;
+        let response_done = session.write_response_tasks_inner(filtered_tasks).await?;
 
         Ok(Some(response_done))
     }
@@ -939,6 +947,9 @@ where
 
                 // before it can mark it as cacheable again.
                 let mut data = range_body_filter.filter_body(data);
+                if matches!(session.response_commit_state, ResponseCommitState::Held(_)) {
+                    return Ok(HttpTask::Body(data, end));
+                }
                 if let Some(duration) = self
                     .inner
                     .response_body_filter(session, &mut data, end, ctx)?

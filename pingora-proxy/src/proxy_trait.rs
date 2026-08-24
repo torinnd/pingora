@@ -38,6 +38,21 @@ pub enum ProxyWarnLogContext {
     DownstreamCache,
 }
 
+/// Whether Pingora may commit a final response header as soon as it arrives.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseCommitPolicy {
+    /// Use the normal response path.
+    #[default]
+    Immediate,
+    /// Hold the final upstream response header until the application commits it.
+    ///
+    /// Body filters must withhold body chunks (set them to `None`) until
+    /// committing the held header. Header-only responses and 101 Switching
+    /// Protocols bypass the gate.
+    Hold,
+}
+
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
@@ -104,6 +119,18 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(false)
+    }
+
+    /// Choose whether to hold the final upstream response header until a
+    /// response-body verdict is ready.
+    ///
+    /// This runs after [`Self::request_filter`] and before cache lookup. A
+    /// held response bypasses cache so every response passes through the
+    /// upstream response filters. For responses ending in trailers, callers
+    /// can finalize and commit from
+    /// [`Self::held_upstream_response_trailer_filter`].
+    fn response_commit_policy(&self, _session: &Session, _ctx: &Self::CTX) -> ResponseCommitPolicy {
+        ResponseCommitPolicy::Immediate
     }
 
     /// Handle the incoming request before any downstream module is executed.
@@ -464,6 +491,45 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(None)
+    }
+
+    /// Filter an upstream response body while its final header is held by a
+    /// [`ResponseCommitPolicy::Hold`] gate.
+    ///
+    /// [`HeldResponseBody`] owns the current body task and exposes the
+    /// transformed header and read-only session state, but no response writer.
+    /// Committing for streaming clears that task and returns a
+    /// [`CommittedResponse`] capability.
+    async fn held_upstream_response_body_filter(
+        &self,
+        _response: HeldResponseBody<'_>,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "ResponseCommitPolicy::Hold requires held_upstream_response_body_filter",
+        )
+    }
+
+    /// Filter response trailers while the final response header is held.
+    /// Implementations that wait for trailers before reaching a verdict must
+    /// commit the [`HeldResponse`] before returning.
+    async fn held_upstream_response_trailer_filter(
+        &self,
+        _response: HeldResponse<'_>,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "held response reached trailers without a committed header",
+        )
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers

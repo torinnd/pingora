@@ -94,10 +94,13 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
+pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseCommitPolicy};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
+    pub use crate::{
+        http_proxy, http_proxy_service, HeldResponse, HeldResponseBody, ProxyHttp,
+        ProxyWarnLogContext, ResponseCommitPolicy, Session,
+    };
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -407,13 +410,48 @@ where
                 None
             }
             HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
-                self.inner
-                    .upstream_response_body_filter(session, data, *eos, ctx)
-                    .await?
+                let duration =
+                    if matches!(session.response_commit_state, ResponseCommitState::Held(_)) {
+                        self.inner
+                            .held_upstream_response_body_filter(
+                                HeldResponseBody::new(session, data, *eos),
+                                ctx,
+                            )
+                            .await?
+                    } else {
+                        self.inner
+                            .upstream_response_body_filter(session, data, *eos, ctx)
+                            .await?
+                    };
+                if matches!(session.response_commit_state, ResponseCommitState::Held(_))
+                    && (data.is_some() || *eos)
+                {
+                    return Error::e_explain(
+                        InternalError,
+                        "response body reached downstream before its held header was committed",
+                    );
+                }
+                duration
             }
             HttpTask::Trailer(Some(trailers)) => {
-                self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
+                if matches!(session.response_commit_state, ResponseCommitState::Held(_)) {
+                    self.inner
+                        .held_upstream_response_trailer_filter(
+                            HeldResponse::new(session),
+                            trailers,
+                            ctx,
+                        )
+                        .await?;
+                    if matches!(session.response_commit_state, ResponseCommitState::Held(_)) {
+                        return Error::e_explain(
+                            InternalError,
+                            "response trailers returned without committing the held header",
+                        );
+                    }
+                } else {
+                    self.inner
+                        .upstream_response_trailer_filter(session, trailers, ctx)?;
+                }
                 None
             }
             _ => {
@@ -472,6 +510,23 @@ where
 use pingora_cache::HttpCache;
 use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 
+enum ResponseCommitState {
+    Immediate,
+    Armed,
+    Held(Box<ResponseHeader>),
+    Committed,
+}
+
+enum ResponseGateTask {
+    Forward(HttpTask),
+    HeaderHeld,
+    Suppress,
+}
+
+fn response_header_commits(header: &ResponseHeader) -> bool {
+    !header.status.is_informational() || header.status == http::StatusCode::SWITCHING_PROTOCOLS
+}
+
 /// The established HTTP session
 ///
 /// This object is what users interact with in order to access the request itself or change the proxy
@@ -508,6 +563,133 @@ pub struct Session {
     upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    response_commit_state: ResponseCommitState,
+}
+
+/// Restricted access to a response whose final header has not been committed.
+pub struct HeldResponse<'a> {
+    session: &'a mut Session,
+}
+
+impl<'a> HeldResponse<'a> {
+    fn new(session: &'a mut Session) -> Self {
+        Self { session }
+    }
+
+    /// Read request and connection state without gaining response-write access.
+    pub fn session(&self) -> &Session {
+        self.session
+    }
+
+    pub fn header(&self) -> &ResponseHeader {
+        let ResponseCommitState::Held(header) = &self.session.response_commit_state else {
+            unreachable!("HeldResponse requires a held response header")
+        };
+        header
+    }
+
+    /// Mutate the transformed header. Callers changing the body must keep
+    /// framing headers such as Content-Length and Transfer-Encoding consistent.
+    pub fn header_mut(&mut self) -> &mut ResponseHeader {
+        let ResponseCommitState::Held(header) = &mut self.session.response_commit_state else {
+            unreachable!("HeldResponse requires a held response header")
+        };
+        header
+    }
+
+    /// Commit the held header and let the framework write the current body task.
+    pub async fn commit(self) -> Result<()> {
+        self.session.commit_held_response_header().await
+    }
+
+    /// Commit the held header and return a capability for streaming body chunks.
+    pub async fn commit_for_streaming(self) -> Result<CommittedResponse<'a>> {
+        self.session.commit_held_response_header().await?;
+        Ok(CommittedResponse {
+            session: self.session,
+        })
+    }
+}
+
+/// A held response body task. The capability owns the current body chunk so
+/// committing for direct streaming can clear it atomically.
+pub struct HeldResponseBody<'a> {
+    response: HeldResponse<'a>,
+    body: &'a mut Option<Bytes>,
+    end_of_stream: bool,
+}
+
+impl<'a> HeldResponseBody<'a> {
+    fn new(session: &'a mut Session, body: &'a mut Option<Bytes>, end_of_stream: bool) -> Self {
+        Self {
+            response: HeldResponse::new(session),
+            body,
+            end_of_stream,
+        }
+    }
+
+    pub fn session(&self) -> &Session {
+        self.response.session()
+    }
+
+    pub fn header(&self) -> &ResponseHeader {
+        self.response.header()
+    }
+
+    pub fn header_mut(&mut self) -> &mut ResponseHeader {
+        self.response.header_mut()
+    }
+
+    pub fn body(&self) -> Option<&Bytes> {
+        self.body.as_ref()
+    }
+
+    pub fn body_mut(&mut self) -> &mut Option<Bytes> {
+        self.body
+    }
+
+    pub fn take_body(&mut self) -> Option<Bytes> {
+        self.body.take()
+    }
+
+    pub fn end_of_stream(&self) -> bool {
+        self.end_of_stream
+    }
+
+    /// Commit the header and leave the current body task for the framework.
+    pub async fn commit(self) -> Result<()> {
+        self.response.commit().await
+    }
+
+    /// Commit the header and suppress the current body task so the returned
+    /// capability can stream it directly.
+    pub async fn commit_for_streaming(self) -> Result<CommittedResponse<'a>> {
+        let HeldResponseBody {
+            response,
+            body,
+            end_of_stream: _,
+        } = self;
+        body.take();
+        response.commit_for_streaming().await
+    }
+}
+
+/// Response-write access after a held final header has been committed.
+#[must_use = "use the committed response to stream body chunks"]
+pub struct CommittedResponse<'a> {
+    session: &'a mut Session,
+}
+
+impl CommittedResponse<'_> {
+    pub fn session(&self) -> &Session {
+        self.session
+    }
+
+    /// Write one body chunk. The framework supplies end-of-stream after the
+    /// held filter returns.
+    pub async fn write_chunk(&mut self, body: Bytes) -> Result<()> {
+        self.session.write_response_body(Some(body), false).await
+    }
 }
 
 impl Session {
@@ -534,6 +716,7 @@ impl Session {
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
+            response_commit_state: ResponseCommitState::Immediate,
         }
     }
 
@@ -598,6 +781,139 @@ impl Session {
             }
             HttpTask::Failed(_) => {}
         }
+        Ok(())
+    }
+
+    pub(crate) fn enforce_response_commit_cache_policy(&mut self, policy: ResponseCommitPolicy) {
+        if policy == ResponseCommitPolicy::Hold && (self.cache.enabled() || self.cache.bypassing())
+        {
+            self.cache
+                .disable(NoCacheReason::Custom("response commit gate"));
+        }
+    }
+
+    fn set_response_commit_policy(&mut self, policy: ResponseCommitPolicy) {
+        self.response_commit_state = match policy {
+            ResponseCommitPolicy::Immediate => ResponseCommitState::Immediate,
+            ResponseCommitPolicy::Hold => ResponseCommitState::Armed,
+        };
+    }
+
+    fn response_gate_task(&mut self, task: HttpTask) -> Result<ResponseGateTask> {
+        match &mut self.response_commit_state {
+            ResponseCommitState::Armed => match task {
+                HttpTask::Header(header, end) => {
+                    if !end
+                        && response_header_commits(&header)
+                        && header.status != http::StatusCode::SWITCHING_PROTOCOLS
+                    {
+                        if self.response_written().is_some_and(response_header_commits) {
+                            return Error::e_explain(
+                                InternalError,
+                                "a final response was written before the commit gate could hold \
+                                 the upstream header",
+                            );
+                        }
+                        self.response_commit_state = ResponseCommitState::Held(header);
+                        Ok(ResponseGateTask::HeaderHeld)
+                    } else {
+                        if response_header_commits(&header) {
+                            self.response_commit_state = ResponseCommitState::Committed;
+                        }
+                        Ok(ResponseGateTask::Forward(HttpTask::Header(header, end)))
+                    }
+                }
+                HttpTask::Failed(_) => Ok(ResponseGateTask::Forward(task)),
+                _ => Error::e_explain(
+                    InternalError,
+                    "response body or trailers arrived before a final response header",
+                ),
+            },
+            ResponseCommitState::Held(_) => match task {
+                HttpTask::Body(None, false) => Ok(ResponseGateTask::Suppress),
+                HttpTask::Failed(_) => Ok(ResponseGateTask::Forward(task)),
+                _ => Error::e_explain(
+                    InternalError,
+                    "response reached a terminal task before its held header was committed",
+                ),
+            },
+            ResponseCommitState::Immediate | ResponseCommitState::Committed => {
+                Ok(ResponseGateTask::Forward(task))
+            }
+        }
+    }
+
+    async fn flush_response_gate_prefix(&mut self, tasks: &mut Vec<HttpTask>) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        if self
+            .write_response_tasks_inner(std::mem::take(tasks))
+            .await?
+        {
+            return Error::e_explain(
+                InternalError,
+                "response ended before its held final header was committed",
+            );
+        }
+        Ok(())
+    }
+
+    fn reset_response_commit_gate_for_retry(&mut self) {
+        if matches!(
+            self.response_commit_state,
+            ResponseCommitState::Armed | ResponseCommitState::Held(_)
+        ) {
+            self.response_commit_state = ResponseCommitState::Armed;
+        }
+    }
+
+    fn discard_response_commit_gate(&mut self) {
+        self.response_commit_state = ResponseCommitState::Immediate;
+    }
+
+    /// Commit the held response header through the normal downstream modules.
+    ///
+    /// The proxy flushes earlier informational responses before invoking body
+    /// filters, so callers may stream body data after this method returns.
+    async fn commit_held_response_header(&mut self) -> Result<()> {
+        if self.response_written().is_some_and(response_header_commits)
+            || self.has_pending_downstream_tasks()
+        {
+            return Error::e_explain(
+                InternalError,
+                "a response was written or queued while the final upstream header was held",
+            );
+        }
+
+        let state = std::mem::replace(
+            &mut self.response_commit_state,
+            ResponseCommitState::Immediate,
+        );
+        let ResponseCommitState::Held(header) = state else {
+            self.response_commit_state = state;
+            return Error::e_explain(
+                InternalError,
+                "commit_held_response_header() called without a held response header",
+            );
+        };
+        if header.status.is_informational() {
+            return Error::e_explain(
+                InternalError,
+                "a committed held response header must be a final, non-1xx response",
+            );
+        }
+        if header.headers.contains_key(http::header::CONTENT_LENGTH)
+            && header.headers.contains_key(http::header::TRANSFER_ENCODING)
+        {
+            return Error::e_explain(
+                InternalError,
+                "a committed held response cannot have both Content-Length and Transfer-Encoding",
+            );
+        }
+
+        self.write_response_header(header, false).await?;
+        self.response_commit_state = ResponseCommitState::Committed;
         Ok(())
     }
 
@@ -796,7 +1112,11 @@ impl Session {
         }
     }
 
-    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+    pub async fn write_response_tasks(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
+        self.write_response_tasks_inner(tasks).await
+    }
+
+    async fn write_response_tasks_inner(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
         let mut seen_upgraded = self.downstream_task_seen_upgraded || self.was_upgraded();
         for task in tasks.iter_mut() {
             self.downstream_response_task_filter(task, &mut seen_upgraded)
@@ -1099,11 +1419,16 @@ where
             }
         }
 
-        if let Some((reuse, err)) = self.proxy_cache(&mut session, &mut ctx).await {
-            // cache hit
+        let commit_policy = self.inner.response_commit_policy(&session, &ctx);
+
+        if let Some((reuse, err)) = self
+            .proxy_cache(&mut session, &mut ctx, commit_policy)
+            .await
+        {
+            // cache hit or purge response
             return self.finish(session, &mut ctx, reuse, err).await;
         }
-        // either uncacheable, or cache miss
+        // either gated, uncacheable, or a cache miss
 
         // there should not be a write lock in the sub req ctx after this point
         self.cleanup_sub_req(&mut session);
@@ -1158,6 +1483,11 @@ where
             }
         }
 
+        // The application hook above has mutable Session access. Reassert the
+        // gate's cache invariant in case it re-enabled caching.
+        session.enforce_response_commit_cache_policy(commit_policy);
+        session.set_response_commit_policy(commit_policy);
+
         let mut retries: usize = 0;
 
         let mut server_reuse = false;
@@ -1171,7 +1501,17 @@ where
 
             match e {
                 Some(error) => {
-                    let retry = error.retry();
+                    // A new attempt cannot replace a final header already
+                    // written downstream. It also cannot safely reuse the
+                    // application, module, and compression state after an
+                    // upstream final header has been held for body filtering.
+                    // Informational responses do not prevent a retry.
+                    let final_header_written = session
+                        .response_written()
+                        .is_some_and(response_header_commits);
+                    let final_header_held =
+                        matches!(session.response_commit_state, ResponseCommitState::Held(_));
+                    let retry = error.retry() && !final_header_written && !final_header_held;
                     // only log error that will be retried here, the final error will be logged below
                     if retry
                         && !self.inner.suppress_proxy_warn_log(
@@ -1193,6 +1533,7 @@ where
                     if !retry {
                         break;
                     }
+                    session.reset_response_commit_gate_for_retry();
                 }
                 None => {
                     proxy_error = None;
@@ -1230,6 +1571,7 @@ where
                 };
                 session.cache.disable(reason);
             }
+            session.discard_response_commit_gate();
             let res = self.inner.fail_to_proxy(&mut session, e, &mut ctx).await;
 
             // final error will have > 0 status unless downstream connection is dead
@@ -1261,6 +1603,7 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        session.discard_response_commit_gate();
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
         if !self.inner.suppress_error_log(&session, ctx, &e) {
             error!(

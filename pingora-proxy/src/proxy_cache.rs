@@ -36,6 +36,7 @@ where
         self: &Arc<Self>,
         session: &mut Session,
         ctx: &mut SV::CTX,
+        response_commit_policy: ResponseCommitPolicy,
     ) -> Option<(bool, Option<Box<Error>>)>
     // None: continue to proxy, Some: return
     where
@@ -71,6 +72,11 @@ where
         // cache purge logic: PURGE short-circuits rest of request
         if self.inner.is_purge(session, ctx) {
             return self.proxy_purge(session, ctx).await;
+        }
+
+        session.enforce_response_commit_cache_policy(response_commit_policy);
+        if response_commit_policy == ResponseCommitPolicy::Hold {
+            return None;
         }
 
         // bypass cache lookup if we predict to be uncacheable
