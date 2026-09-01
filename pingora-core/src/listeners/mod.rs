@@ -290,6 +290,10 @@ impl TransportStack {
         self.l4.as_str()
     }
 
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.l4.local_addr()
+    }
+
     pub async fn accept(&self) -> Result<UninitializedStream> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
@@ -434,6 +438,15 @@ impl Listeners {
             .collect()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn transferable_addresses(&self) -> Vec<String> {
+        self.stacks
+            .iter()
+            .filter(|stack| stack.l4.uses_fd_table())
+            .map(|stack| stack.l4.as_ref().to_string())
+            .collect()
+    }
+
     /// Set a connection filter for all endpoints in this listener collection
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
@@ -552,7 +565,7 @@ mod test {
         assert_eq!(listeners.len(), 2);
         let addrs: Vec<_> = listeners
             .iter()
-            .map(|s| s.l4.local_addr().unwrap())
+            .map(|s| *s.local_addr().unwrap().as_inet().unwrap())
             .collect();
         for listener in listeners {
             tokio::spawn(async move {
@@ -747,6 +760,21 @@ mod test {
             assert_eq!(request.await.unwrap(), reqwest::StatusCode::OK);
         }
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn port_zero_is_not_transferable() {
+        let mut listeners = Listeners::new();
+        listeners.add_tcp("127.0.0.1:0");
+        listeners.add_tcp("[::1]:0");
+        listeners.add_tcp("localhost:0");
+        listeners.add_tcp("127.0.0.1:8080");
+
+        assert_eq!(
+            listeners.transferable_addresses(),
+            vec!["127.0.0.1:8080".to_string()]
+        );
     }
 
     #[cfg(feature = "connection_filter")]

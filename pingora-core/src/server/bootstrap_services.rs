@@ -243,8 +243,17 @@ impl Bootstrap {
     }
 
     #[cfg(unix)]
+    fn should_load_fds(&self, upgrade: bool) -> bool {
+        upgrade
+            && self
+                .expected_listen_addrs
+                .as_ref()
+                .is_none_or(|addresses| !addresses.is_empty())
+    }
+
+    #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        if upgrade {
+        if self.should_load_fds(upgrade) {
             debug!("Trying to receive socks");
             let mut fds = Fds::new();
             fds.get_from_sock(self.upgrade_sock.as_str())?;
@@ -290,6 +299,21 @@ impl BackgroundService for BootstrapService {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_expected_addresses_skip_fd_handoff() {
+        let (execution_phase_watch, _) = broadcast::channel(1);
+        let mut bootstrap = Bootstrap::new(&None, &ServerConf::default(), &execution_phase_watch);
+
+        assert!(!bootstrap.should_load_fds(false));
+        assert!(bootstrap.should_load_fds(true));
+
+        bootstrap.set_expected_listen_addrs(HashSet::new());
+        assert!(!bootstrap.should_load_fds(true));
+
+        bootstrap.set_expected_listen_addrs(["127.0.0.1:80".to_string()].into_iter().collect());
+        assert!(bootstrap.should_load_fds(true));
+    }
 
     #[test]
     fn expected_addresses_prune_already_loaded_fds() {
